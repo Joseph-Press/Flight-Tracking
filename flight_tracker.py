@@ -3,6 +3,8 @@ import time
 import json
 import requests
 import gspread
+import argparse
+from collections import defaultdict
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -49,6 +51,9 @@ def get_amadeus_token():
 access_token = get_amadeus_token()
 
 DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL', '')
+# Configurable price threshold for discord, default $80.
+DISCORD_PRICE_THRESHOLD = float(os.environ.get('DISCORD_PRICE_THRESHOLD', '80.0'))
+
 BAY_AREA_AIRPORTS = ['SFO', 'SJC', 'OAK']
 LA_AIRPORTS = ['LAX']
 
@@ -88,7 +93,7 @@ def fetch_cheapest_flight(origin, destination, dep_date, ret_date=None):
             'departureDate': dep_date,
             'adults': 1,
             'currencyCode': 'USD',
-            'max': 1 # Get top 1 because we only care about the cheapest
+            'max': 1
         }
         if ret_date:
             params['returnDate'] = ret_date
@@ -99,67 +104,96 @@ def fetch_cheapest_flight(origin, destination, dep_date, ret_date=None):
         if data:
             return float(data[0]['price']['total'])
     except Exception as error:
-        # Ignore individual errors due to high volume, handle silently
         pass
     return None
 
-def format_flight_entry(f):
-    anniv_flag = " 🎉 **ANNIV!**" if f.get('is_anniv') else ""
-    return f"`{f['origin']} ✈️ {f['destination']}` | {f['dep_date']} to {f['ret_date']} | **${f['price']:.2f}** ({f['type']}){anniv_flag}"
-
-def push_to_sheets_and_discord(all_results):
-    # 1. Google Sheets Logic
-    if gc and GOOGLE_SHEET_ID:
+def process_results(all_results, skip_sheets=False, threshold=80.0):
+    # --- 1. Google Sheets Logic (Calendar Format) ---
+    if not skip_sheets and gc and GOOGLE_SHEET_ID:
         try:
             sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
             
+            # Group by Month: e.g. "2026-04"
+            flights_by_month = defaultdict(list)
+            for f in all_results:
+                month_key = f['dep_date'][:7] # YYYY-MM
+                flights_by_month[month_key].append(f)
+                
             # Prepare rows
-            rows = [["Origin", "Destination", "Departure Date", "Return Date", "Price", "Booking Type", "Is Anniversary"]]
-            # Sort all flights by date then price for the sheet
-            sorted_results = sorted(all_results, key=lambda x: (x['dep_date'], x['price']))
-            for f in sorted_results:
-                rows.append([
-                    f['origin'], 
-                    f['destination'], 
-                    f['dep_date'], 
-                    f['ret_date'], 
-                    f['price'], 
-                    f['type'], 
-                    "Yes" if f.get('is_anniv') else "No"
-                ])
+            rows = [["Month", "Option 1", "Option 2", "Option 3", "Option 4", "Option 5"]]
+            
+            for month in sorted(flights_by_month.keys()):
+                # Sort flights in this month by price ascending
+                month_flights = sorted(flights_by_month[month], key=lambda x: x['price'])
+                
+                # Take top 5 unique cheapest weekends (avoiding exact duplicates if possible)
+                top_5 = []
+                seen_dates = set()
+                for f in month_flights:
+                    date_pair = (f['dep_date'], f['ret_date'])
+                    if date_pair not in seen_dates:
+                        seen_dates.add(date_pair)
+                        top_5.append(f)
+                    if len(top_5) == 5:
+                        break
+                        
+                row_data = [month]
+                for f in top_5:
+                    anniv = " 🎉" if f.get('is_anniv') else ""
+                    cell_text = f"{f['origin']}->{f['destination']}\n{f['dep_date']} to {f['ret_date']}\n${f['price']:.2f}{anniv}"
+                    row_data.append(cell_text)
+                    
+                # Pad to 6 columns total if less than 5 flights found
+                while len(row_data) < 6:
+                    row_data.append("")
+                    
+                rows.append(row_data)
                 
             sheet.clear()
-            sheet.update(f"A1:G{len(rows)}", rows)
+            # Make columns a bit wider to handle multiline text
+            sheet.update(f"A1:F{len(rows)}", rows)
+            sheet.format('A1:F1', {'textFormat': {'bold': True}})
+            sheet.format(f"A2:F{len(rows)}", {"wrapStrategy": "WRAP"})
             
-            # Format header row to be bold
-            sheet.format('A1:G1', {'textFormat': {'bold': True}})
-            print(f"Successfully pushed {len(all_results)} flights to Google Sheet!")
+            print(f"Successfully pushed calendar format to Google Sheet!")
         except Exception as e:
             print(f"Failed to push to Google Sheets: {e}")
-    else:
-        print("Skipping Google Sheets push (credentials or Sheet ID missing).")
-        
-    # 2. Discord Alert Logic (ONLY sub-$100 flights)
-    cheap_flights = [f for f in all_results if f['price'] < 100.0]
+    elif skip_sheets:
+        print("Skipping Google Sheets push due to --skip-sheets flag.")
+
+    # --- 2. Discord Alert Logic (Grouped and succinct) ---
+    cheap_flights = [f for f in all_results if f['price'] <= threshold]
     
     if not DISCORD_WEBHOOK_URL:
         print("No discord webhook URL configured. Printing cheap flights to console instead.")
         if cheap_flights:
-            print(f"\n=== 🚨 {len(cheap_flights)} Flights Under $100 ===")
+            print(f"\n=== 🚨 Flights Under ${threshold} ===")
             for f in sorted(cheap_flights, key=lambda x: x['price']):
-                print(format_flight_entry(f))
+                print(f"{f['origin']}->{f['destination']} | {f['dep_date']} to {f['ret_date']} | ${f['price']:.2f}")
         return
         
     if not cheap_flights:
-        print("No flights under $100 found. Skipping Discord alert.")
+        print(f"No flights under ${threshold} found. Skipping Discord alert.")
         return
         
-    # Sort and format for Discord
-    cheap_flights.sort(key=lambda x: x['price'])
-    
-    message_lines = [f"# 🚨 CHEAP FLIGHT ALERT: {len(cheap_flights)} Flights Under $100!"]
+    # Group by route and price to reduce spam
+    # e.g. (SFO, LAX, 90.82) -> ["2026-04-10 to 2026-04-13", "2026-04-17 to 2026-04-20"]
+    grouped_flights = defaultdict(list)
     for f in cheap_flights:
-        message_lines.append(f"- {format_flight_entry(f)}")
+        key = (f['origin'], f['destination'], f['price'], f['type'])
+        grouped_flights[key].append(f"{f['dep_date']} to {f['ret_date']}")
+        
+    message_lines = [f"# 🚨 CHEAP FLIGHT ALERT: Found {len(cheap_flights)} flights under ${threshold}!"]
+    
+    # Sort by price ascending
+    sorted_groups = sorted(grouped_flights.items(), key=lambda x: x[0][2])
+    
+    for (origin, dest, price, btype), date_ranges in sorted_groups:
+        dates_str = ", ".join(date_ranges)
+        # If there are too many dates, truncate
+        if len(dates_str) > 100:
+            dates_str = dates_str[:97] + "..."
+        message_lines.append(f"- `{origin} ✈️ {dest}` | **${price:.2f}** ({btype}) | {dates_str}")
         
     full_msg = "\n".join(message_lines)
     chunks = [full_msg[i:i+1900] for i in range(0, len(full_msg), 1900)]
@@ -171,23 +205,26 @@ def push_to_sheets_and_discord(all_results):
         except Exception as e:
             print(f"Failed to send Discord alert: {e}")
 
+
 def main():
+    parser = argparse.ArgumentParser(description="Flight Tracker")
+    parser.add_argument('--days', type=int, default=180, help='Number of days ahead to search (default 180)')
+    parser.add_argument('--skip-sheets', action='store_true', help='Skip pushing to Google Sheets')
+    parser.add_argument('--threshold', type=float, default=DISCORD_PRICE_THRESHOLD, help='Discord price alert threshold')
+    args = parser.parse_args()
+
     start_date = datetime.now()
-    dates = get_flight_dates(start_date, 180)
+    dates = get_flight_dates(start_date, args.days)
     
     all_results = []
-    
-    # Map of routes to consider:
     routes = []
     for bay in BAY_AREA_AIRPORTS:
         for la in LA_AIRPORTS:
             routes.append((bay, la))
             routes.append((la, bay))
             
-    print(f"Starting flight search for {len(dates)} weekends across {len(routes)} routes...")
-    print("Evaluating Round-Trips vs 2x One-Ways globally.")
+    print(f"Starting search for {len(dates)} weekends across {len(routes)} routes (Next {args.days} days)...")
     
-    # Cache one-ways so we don't query same day multiple times
     one_way_cache = {}
     def get_one_way(origin, dest, date):
         key = (origin, dest, date)
@@ -198,11 +235,9 @@ def main():
         
     for index, (origin, dest) in enumerate(routes):
         for dep_date, ret_date in dates:
-            # 1. Price as Round Trip
             rt_price = fetch_cheapest_flight(origin, dest, dep_date, ret_date)
             time.sleep(0.3)
             
-            # 2. Price as Two One-Ways
             ow_out = get_one_way(origin, dest, dep_date)
             ow_in = get_one_way(dest, origin, ret_date)
             
@@ -220,9 +255,7 @@ def main():
                 best_price, booking_type = prices[0]
                 
             if best_price is not None:
-                # March 21st anniversary check
                 is_anniv = ('-03-21' in dep_date or '-03-21' in ret_date or ('-03-20' in dep_date and '-03-22' in ret_date))
-                
                 all_results.append({
                     'origin': origin,
                     'destination': dest,
@@ -233,9 +266,9 @@ def main():
                     'is_anniv': is_anniv
                 })
                 
-            print(f"[{origin}->{dest}] {dep_date} to {ret_date} | Best: ${best_price} ({booking_type})")
+            print(f"[{origin}->{dest}] {dep_date} to {ret_date} | Best: ${best_price}")
                 
-    push_to_sheets_and_discord(all_results)
+    process_results(all_results, skip_sheets=args.skip_sheets, threshold=args.threshold)
     print("Done!")
 
 if __name__ == "__main__":

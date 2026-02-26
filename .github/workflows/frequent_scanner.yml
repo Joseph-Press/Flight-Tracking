@@ -1,14 +1,13 @@
-name: Daily Flight Tracker
+name: Frequent Flight Scanner
 
 on:
   schedule:
-    # 16:00 UTC is 8:00 AM PST (9:00 AM PDT)
-    - cron: '0 16 * * *'
-  # Allow manual trigger for testing
+    # Run every 6 hours (e.g. 0, 6, 12, 18 UTC)
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
-  run-tracker:
+  run-scanner:
     runs-on: ubuntu-latest
     
     steps:
@@ -26,13 +25,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run flight tracker script (Big Check)
+      - name: Run flight tracker script (Small Check)
         env:
           AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
           AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          # The daily big check alerts on anything under $100
-          DISCORD_PRICE_THRESHOLD: "100.0"
-        run: python flight_tracker.py --days 180
+          # We don't need Google credentials here since we are skipping sheets
+          # The frequent check alerts on anything under $80
+          DISCORD_PRICE_THRESHOLD: "80.0"
+        run: python flight_tracker.py --days 45 --skip-sheets
