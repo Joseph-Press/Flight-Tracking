@@ -30,7 +30,5 @@ jobs:
           AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
           AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # We don't need Google credentials here since we are skipping sheets
-          # The frequent check alerts on anything under $80
           DISCORD_PRICE_THRESHOLD: "80.0"
         run: python flight_tracker.py --days 45 --skip-sheets
