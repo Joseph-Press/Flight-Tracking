@@ -81,30 +81,62 @@ def get_flight_dates(start_date, days_ahead=180):
         
     return sorted(list(dates))
 
-def fetch_cheapest_flight(origin, destination, dep_date, ret_date=None):
+def fetch_cheapest_flight(origin, destination, dep_date, ret_date=None, retries=3):
     if not access_token:
         return None
         
-    try:
-        headers = {'Authorization': f'Bearer {access_token}'}
-        params = {
-            'originLocationCode': origin,
-            'destinationLocationCode': destination,
-            'departureDate': dep_date,
-            'adults': 1,
-            'currencyCode': 'USD',
-            'max': 1
-        }
-        if ret_date:
-            params['returnDate'] = ret_date
+    for attempt in range(retries):
+        try:
+            headers = {'Authorization': f'Bearer {access_token}'}
+            params = {
+                'originLocationCode': origin,
+                'destinationLocationCode': destination,
+                'departureDate': dep_date,
+                'adults': 1,
+                'currencyCode': 'USD',
+                'max': 1
+            }
+            if ret_date:
+                params['returnDate'] = ret_date
+                
+            res = requests.get(AMADEUS_SEARCH_URL, headers=headers, params=params)
             
-        res = requests.get(AMADEUS_SEARCH_URL, headers=headers, params=params)
-        res.raise_for_status()
-        data = res.json().get('data', [])
-        if data:
-            return float(data[0]['price']['total'])
-    except Exception as error:
-        pass
+            # If successful, parse and return the price
+            if res.status_code == 200:
+                data = res.json().get('data', [])
+                if data:
+                    return float(data[0]['price']['total'])
+                return None
+            
+            # 429: Rate Limit or Quota Exceeded
+            if res.status_code == 429:
+                err_text = res.text.lower()
+                # Check if it's a hard monthly quota limit
+                if "quota" in err_text or "exceeded" in err_text:
+                    print(f"\n[CRITICAL ERROR] Amadeus Monthly Quota Exceeded! Terminating script to prevent further errors.")
+                    print(f"Server Response: {res.text}")
+                    exit(1)
+                
+                # Otherwise, it's a speed limit (Too Many Requests). Apply exponential backoff.
+                wait_time = (2 ** attempt) + 1  # 2s, 3s, 5s...
+                print(f"[WARNING] Rate limit hit for {origin}->{destination}. Retrying in {wait_time}s... (Attempt {attempt+1}/{retries})")
+                time.sleep(wait_time)
+                continue
+                
+            # 401 or 403: Unauthorized / Forbidden
+            if res.status_code in (401, 403):
+                print(f"\n[CRITICAL ERROR] Amadeus Authentication Failed (401/403). Check your API keys!")
+                print(f"Server Response: {res.text}")
+                exit(1)
+                
+            # Handle other expected API errors (e.g. no flights found for that specific date)
+            res.raise_for_status()
+            
+        except requests.exceptions.RequestException as e:
+            # If it's a generic connection error or a non-429/401 HTTP error we want to swallow it but log it visually
+            print(f"[API ERROR] {origin}->{destination} on {dep_date}: {e}")
+            break # Break out of retry loop for standard errors (don't hammer the server)
+            
     return None
 
 def process_results(all_results, skip_sheets=False, threshold=80.0):
