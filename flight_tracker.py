@@ -256,36 +256,16 @@ def main():
             routes.append((la, bay))
             
     print(f"Starting search for {len(dates)} weekends across {len(routes)} routes (Next {args.days} days)...")
-    
-    one_way_cache = {}
-    def get_one_way(origin, dest, date):
-        key = (origin, dest, date)
-        if key not in one_way_cache:
-            one_way_cache[key] = fetch_cheapest_flight(origin, dest, date)
-            time.sleep(0.3)
-        return one_way_cache[key]
         
     for index, (origin, dest) in enumerate(routes):
         for dep_date, ret_date in dates:
+            # We ONLY check Round Trips to drastically conserve the Amadeus API quota
             rt_price = fetch_cheapest_flight(origin, dest, dep_date, ret_date)
             time.sleep(0.3)
             
-            ow_out = get_one_way(origin, dest, dep_date)
-            ow_in = get_one_way(dest, origin, ret_date)
+            best_price = rt_price
+            booking_type = "RoundTrip" if rt_price is not None else None
             
-            best_price = None
-            booking_type = None
-            
-            prices = []
-            if rt_price is not None:
-                prices.append((rt_price, "RoundTrip"))
-            if ow_out is not None and ow_in is not None:
-                prices.append((ow_out + ow_in, "2x OneWay"))
-                
-            if prices:
-                prices.sort(key=lambda x: x[0])
-                best_price, booking_type = prices[0]
-                
             if best_price is not None:
                 is_anniv = ('-03-21' in dep_date or '-03-21' in ret_date or ('-03-20' in dep_date and '-03-22' in ret_date))
                 all_results.append({
